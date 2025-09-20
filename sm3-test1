@@ -1,0 +1,269 @@
+#include <stdio.h>
+#include <string.h>
+#include <stdint.h>
+#include <stdlib.h>
+#include <io.h>  // Windows 环境文件存在性判断
+
+// -------------------------- SM3 核心常量定义 --------------------------
+// 初始向量（IV）：SM3 标准规定的 8 个 32 位字
+const uint32_t SM3_IV[8] = {
+    0x7380166f, 0x4914b2b9, 0x172442d7, 0xda8a0600,
+    0xa96f30bc, 0x163138aa, 0xe38dee4d, 0xb0fb0e4e
+};
+
+// 轮常量 Tj：前 16 轮用 0x79cc4519，后 48 轮用 0x7a879d8a
+const uint32_t SM3_T[64] = {
+    0x79cc4519, 0x79cc4519, 0x79cc4519, 0x79cc4519,
+    0x79cc4519, 0x79cc4519, 0x79cc4519, 0x79cc4519,
+    0x79cc4519, 0x79cc4519, 0x79cc4519, 0x79cc4519,
+    0x79cc4519, 0x79cc4519, 0x79cc4519, 0x79cc4519,
+    0x7a879d8a, 0x7a879d8a, 0x7a879d8a, 0x7a879d8a,
+    0x7a879d8a, 0x7a879d8a, 0x7a879d8a, 0x7a879d8a,
+    0x7a879d8a, 0x7a879d8a, 0x7a879d8a, 0x7a879d8a,
+    0x7a879d8a, 0x7a879d8a, 0x7a879d8a, 0x7a879d8a,
+    0x7a879d8a, 0x7a879d8a, 0x7a879d8a, 0x7a879d8a,
+    0x7a879d8a, 0x7a879d8a, 0x7a879d8a, 0x7a879d8a,
+    0x7a879d8a, 0x7a879d8a, 0x7a879d8a, 0x7a879d8a,
+    0x7a879d8a, 0x7a879d8a, 0x7a879d8a, 0x7a879d8a,
+    0x7a879d8a, 0x7a879d8a, 0x7a879d8a, 0x7a879d8a,
+    0x7a879d8a, 0x7a879d8a, 0x7a879d8a, 0x7a879d8a
+};
+
+// -------------------------- 辅助工具函数 --------------------------
+// 循环左移：x 为输入值，n 为左移位数，返回左移后结果
+static uint32_t sm3_rotate_left(uint32_t x, int n) {
+    return (x << n) | (x >> (32 - n));
+}
+
+// 打印 256 位哈希值（固定 32 字节）
+static void sm3_print_hash(const uint8_t *hash) {
+    for (int i = 0; i < 32; i++) {
+        printf("%02x", hash[i]);  // 十六进制补零打印
+    }
+    printf("\n");
+}
+
+// -------------------------- SM3 核心算法模块 --------------------------
+// 1. 消息填充：将原始消息扩展为 512 位（64 字节）的整数倍
+static int sm3_pad(const uint8_t *msg, size_t msg_len, uint8_t **padded_buf, size_t *padded_len) {
+    if (msg == NULL || padded_buf == NULL || padded_len == NULL) {
+        printf("[错误] 填充函数参数无效\n");
+        return -1;
+    }
+
+    // 计算填充后总长度：满足 (len % 64 == 0)，且保留 1 字节补1 + 8 字节存长度
+    size_t remainder = msg_len % 64;
+    size_t zero_len = (remainder < 56) ? (56 - remainder) : (56 + 64 - remainder);
+    *padded_len = msg_len + 1 + zero_len + 8;
+
+    // 分配填充缓冲区
+    *padded_buf = (uint8_t *)malloc(*padded_len);
+    if (*padded_buf == NULL) {
+        printf("[错误] 填充缓冲区内存分配失败\n");
+        return -1;
+    }
+    memset(*padded_buf, 0, *padded_len);
+
+    // 复制原始消息 + 补 0x80（二进制 10000000）
+    memcpy(*padded_buf, msg, msg_len);
+    (*padded_buf)[msg_len] = 0x80;
+
+    // 补原始消息长度（单位：bit，大端序）
+    uint64_t msg_bit_len = (uint64_t)msg_len * 8;
+    for (int i = 0; i < 8; i++) {
+        (*padded_buf)[*padded_len - 8 + i] = (uint8_t)((msg_bit_len >> ((7 - i) * 8)) & 0xFF);
+    }
+
+    return 0;
+}
+
+// 2. 分组扩展：将 512 位分组扩展为 68 个 W 和 64 个 W' 32 位字
+static void sm3_expand(const uint8_t *block, uint32_t W[68], uint32_t W1[64]) {
+    // 生成前 16 个 W（大端序拼接 4 字节为 32 位字）
+    for (int i = 0; i < 16; i++) {
+        W[i] = (uint32_t)block[i * 4] << 24 |
+               (uint32_t)block[i * 4 + 1] << 16 |
+               (uint32_t)block[i * 4 + 2] << 8 |
+               (uint32_t)block[i * 4 + 3];
+    }
+
+    // 生成后 52 个 W（SM3 扩展公式）
+    for (int i = 16; i < 68; i++) {
+        uint32_t p1 = sm3_rotate_left(W[i - 16] ^ W[i - 9] ^ sm3_rotate_left(W[i - 3], 15), 7);
+        W[i] = p1 ^ sm3_rotate_left(W[i - 13], 17) ^ W[i - 6];
+    }
+
+    // 生成 W'（辅助扩展字）
+    for (int j = 0; j < 64; j++) {
+        W1[j] = W[j] ^ W[j + 4];
+    }
+}
+
+// 3. 压缩函数：对单个 512 位分组迭代，更新状态
+static void sm3_compress(uint32_t state[8], const uint8_t *block) {
+    uint32_t W[68] = {0};
+    uint32_t W1[64] = {0};
+    sm3_expand(block, W, W1);  // 先扩展分组
+
+    // 保存当前状态（A~H）
+    uint32_t A = state[0], B = state[1], C = state[2], D = state[3];
+    uint32_t E = state[4], F = state[5], G = state[6], H = state[7];
+
+    // 64 轮迭代（前 16 轮与后 48 轮 FF/GG 函数差异）
+    for (int j = 0; j < 64; j++) {
+        // 计算 SS1、SS2
+        uint32_t SS1 = sm3_rotate_left(sm3_rotate_left(A, 12) + E + sm3_rotate_left(SM3_T[j], j), 7);
+        uint32_t SS2 = SS1 ^ sm3_rotate_left(A, 12);
+
+        // 计算 TT1、TT2（分轮次使用不同逻辑）
+        uint32_t TT1, TT2;
+        if (j < 16) {
+            TT1 = (A ^ B ^ C) + D + SS2 + W1[j];
+            TT2 = (E ^ F ^ G) + H + SS1 + W[j];
+        } else {
+            TT1 = ((A & B) | (A & C) | (B & C)) + D + SS2 + W1[j];
+            TT2 = ((E & F) | ((~E) & G)) + H + SS1 + W[j];
+        }
+
+        // 更新状态变量（按 SM3 标准顺序）
+        D = C;
+        C = sm3_rotate_left(B, 9);
+        B = A;
+        A = TT1;
+        H = G;
+        G = sm3_rotate_left(F, 19);
+        F = E;
+        E = sm3_rotate_left(TT2, 9) ^ sm3_rotate_left(TT2, 17) ^ TT2;  // P0 函数
+    }
+
+    // 迭代后与原状态异或更新
+    state[0] ^= A;
+    state[1] ^= B;
+    state[2] ^= C;
+    state[3] ^= D;
+    state[4] ^= E;
+    state[5] ^= F;
+    state[6] ^= G;
+    state[7] ^= H;
+}
+
+// 4. 字符串哈希计算：输入字符串，输出 32 字节哈希
+int sm3_hash_string(const char *str, uint8_t *hash) {
+    if (str == NULL || hash == NULL) {
+        printf("[错误] 字符串哈希参数无效\n");
+        return -1;
+    }
+
+    size_t msg_len = strlen(str);
+    uint8_t *padded_buf = NULL;
+    size_t padded_len = 0;
+
+    // 1. 消息填充
+    if (sm3_pad((uint8_t *)str, msg_len, &padded_buf, &padded_len) != 0) {
+        free(padded_buf);
+        return -1;
+    }
+
+    // 2. 初始化状态
+    uint32_t state[8];
+    memcpy(state, SM3_IV, sizeof(SM3_IV));
+
+    // 3. 分分组压缩
+    for (size_t i = 0; i < padded_len; i += 64) {
+        sm3_compress(state, padded_buf + i);
+    }
+
+    // 4. 状态转哈希字节（大端序）
+    for (int i = 0; i < 8; i++) {
+        hash[i * 4] = (uint8_t)((state[i] >> 24) & 0xFF);
+        hash[i * 4 + 1] = (uint8_t)((state[i] >> 16) & 0xFF);
+        hash[i * 4 + 2] = (uint8_t)((state[i] >> 8) & 0xFF);
+        hash[i * 4 + 3] = (uint8_t)(state[i] & 0xFF);
+    }
+
+    free(padded_buf);
+    return 0;
+}
+
+// 5. 文件哈希计算：输入文件路径，输出 32 字节哈希（避免大文件内存溢出）
+int sm3_hash_file(const char *file_path, uint8_t *hash) {
+    if (file_path == NULL || hash == NULL) {
+        printf("[错误] 文件哈希参数无效\n");
+        return -1;
+    }
+
+    // 检查文件是否存在
+    if (_access(file_path, 0) != 0) {
+        printf("[错误] 文件不存在：%s\n", file_path);
+        return -1;
+    }
+
+    // 打开文件（二进制只读）
+    FILE *fp = fopen(file_path, "rb");
+    if (fp == NULL) {
+        printf("[错误] 无法打开文件：%s\n", file_path);
+        return -1;
+    }
+
+    // 初始化状态
+    uint32_t state[8];
+    memcpy(state, SM3_IV, sizeof(SM3_IV));
+
+    uint8_t block[64] = {0};
+    size_t read_len = 0;
+    uint64_t total_bit_len = 0;  // 记录文件总长度（bit）
+
+    // 处理完整 64 字节块
+    while ((read_len = fread(block, 1, 64, fp)) == 64) {
+        total_bit_len += 64 * 8;
+        sm3_compress(state, block);
+        memset(block, 0, 64);
+    }
+
+    // 处理剩余不足 64 字节的块（手动填充）
+    total_bit_len += read_len * 8;
+    block[read_len] = 0x80;  // 补 1
+
+    // 分情况补长度（避免新增块）
+    if (read_len + 1 <= 56) {
+        // 剩余空间足够存长度，直接补在当前块
+        for (int i = 0; i < 8; i++) {
+            block[56 + i] = (uint8_t)((total_bit_len >> ((7 - i) * 8)) & 0xFF);
+        }
+        sm3_compress(state, block);
+    } else {
+        // 剩余空间不足，先压缩当前块，再新增块存长度
+        sm3_compress(state, block);
+        memset(block, 0, 64);
+        for (int i = 0; i < 8; i++) {
+            block[56 + i] = (uint8_t)((total_bit_len >> ((7 - i) * 8)) & 0xFF);
+        }
+        sm3_compress(state, block);
+    }
+
+    // 状态转哈希字节
+    for (int i = 0; i < 8; i++) {
+        hash[i * 4] = (uint8_t)((state[i] >> 24) & 0xFF);
+        hash[i * 4 + 1] = (uint8_t)((state[i] >> 16) & 0xFF);
+        hash[i * 4 + 2] = (uint8_t)((state[i] >> 8) & 0xFF);
+        hash[i * 4 + 3] = (uint8_t)(state[i] & 0xFF);
+    }
+
+    fclose(fp);
+    return 0;
+}
+
+// -------------------------- 测试用例（验证正确性） --------------------------
+void sm3_test() {
+    uint8_t hash[32] = {0};
+    printf("==================== SM3 算法测试 ====================\n");
+
+    // 测试1：空字符串（标准结果：1ab21d8355cfa17f8e61194831e81a8f22bec8c728fefb747ed035eb5082aa2b）
+    printf("1. 空字符串哈希：");
+    if (sm3_hash_string("", hash) == 0) {
+        sm3_print_hash(hash);
+    }
+
+    // 测试2："abc"（标准结果：66c7f0f462eeedd9d1f2d46bdc10e4e24167c4875cf2f7a2297da02b8f4ba8e0）
+    printf("2. \"abc\" 哈希：   ");
+    if (sm3_hash_string("abc
